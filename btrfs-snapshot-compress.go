@@ -62,7 +62,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.0"
+const VERSION = "0.1.1"
 
 const (
 	QUEUE_LIMIT       = 10000

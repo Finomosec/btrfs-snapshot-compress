@@ -62,7 +62,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.2"
+const VERSION = "0.1.3"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -886,16 +886,13 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 				logRefErr("path-resolve", r.root, r.inum, r.offset, err)
 				continue
 			}
-			// Try RDWR first (works for normal files), fall back to RDONLY
-			// (needed for read-only snapshots).
-			sibFd, err := syscall.Open(sibPath, syscall.O_RDWR, 0)
+			// btrfs-snapshot-dedup proves RDONLY is sufficient for FIDEDUPERANGE
+			// on both src and dst. Same-FS, no privilege escalation needed.
+			sibFd, err := syscall.Open(sibPath, syscall.O_RDONLY, 0)
 			if err != nil {
-				sibFd, err = syscall.Open(sibPath, syscall.O_RDONLY, 0)
-				if err != nil {
-					cnt.refDedupFailed.Add(1)
-					logRefErr("open", r.root, r.inum, r.offset, err)
-					continue
-				}
+				cnt.refDedupFailed.Add(1)
+				logRefErr("open", r.root, r.inum, r.offset, err)
+				continue
 			}
 			// FIDEDUPERANGE: pull sibling [r.offset, r.offset+oldLen] to point
 			// at the live's compressed range [ex.logical, ex.logical+oldLen].

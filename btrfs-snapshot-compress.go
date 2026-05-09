@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.6"
+const VERSION = "0.1.7"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -1011,6 +1011,14 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 				syscall.Close(sibFd)
 				continue
 			}
+
+			// Brute-force pread prefetch into page cache for both src+dst.
+			// FIDEDUPERANGE reads page-by-page without readahead — without
+			// this, throughput drops by 10-20× especially on HDDs.
+			// (Same approach as btrfs-snapshot-dedup, see kdb
+			// docs/btrfs-dedup-performance.md.)
+			prefetchRange(fdRW, int64(ex.logical), int64(useLen))
+			prefetchRange(sibFd, int64(r.offset), int64(useLen))
 
 			_, derr := fideduperange(fdRW, ex.logical, sibFd, r.offset, useLen)
 			syscall.Close(sibFd)

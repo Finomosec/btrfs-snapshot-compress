@@ -345,4 +345,4 @@ path-from-mount to get the absolute path.
 
 ## License
 
-GPL-2.0 (same as the dedup sister project).
+GPL-2.0

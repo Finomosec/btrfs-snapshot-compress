@@ -62,7 +62,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.3"
+const VERSION = "0.1.4"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -463,53 +463,39 @@ func isNocow(fd int) bool {
 // Resolve (root, inum, offset) → absolute path
 // =================================================================
 
-// rootInumToPath uses BTRFS_IOC_INO_LOOKUP to map a root + inum to a path.
-// The mountFd is the open fd of the btrfs mount point.
-// Returns absolute path under mount.
+// rootInumToPath uses BTRFS_IOC_INO_LOOKUP to map a (root, inum) pair to an
+// absolute filesystem path under `mount`.
+//
+// btrfs INO_LOOKUP with a non-zero objectid walks up the inode_ref tree and
+// returns the file's FULL path (including filename) RELATIVE to the subvol
+// root, NUL-terminated, in args.name.
+//
+// We then prepend the subvol's path-from-mount to get the absolute path.
 func rootInumToPath(mount string, mountFd int, root, inum uint64) (string, error) {
-	// btrfs_ioctl_ino_lookup_args
+	// btrfs_ioctl_ino_lookup_args: 16 bytes header + 4080 byte name buffer = 4096 total
 	const argsSize = 4096
 	args := make([]byte, argsSize)
 	binary.LittleEndian.PutUint64(args[0:8], root)
 	binary.LittleEndian.PutUint64(args[8:16], inum)
-	// 4080 bytes of name buffer follow
 
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd), IOC_INO_LOOKUP, uintptr(unsafe.Pointer(&args[0])))
 	if errno != 0 {
 		return "", errno
 	}
-	// args[16:] is the directory path (NUL-terminated). For inum-resolved files
-	// btrfs returns the path-to-the-CONTAINING-directory but not the file name.
-	// We then need to scan that directory for inum match.
-	dirRel := strings.TrimRight(string(bytes.TrimRight(args[16:], "\x00")), "/")
-	// Resolve subvol root path via /proc — fallback: scan
-	subvolRoot, err := resolveSubvolPath(mount, mountFd, root)
+	// args[16:] is NUL-terminated. The kernel returns "dir1/dir2/filename"
+	// (no leading slash, no trailing slash for files; but historically it
+	// can have a trailing slash). Strip both for safety.
+	rel := strings.Trim(string(bytes.TrimRight(args[16:], "\x00")), "/")
+	if rel == "" {
+		// Empty for the subvol root inode itself — caller doesn't expect a "directory" sibling
+		return "", fmt.Errorf("empty path for root=%d inum=%d (subvol root?)", root, inum)
+	}
+
+	subvolPath, err := resolveSubvolPath(mount, mountFd, root)
 	if err != nil {
 		return "", err
 	}
-	dir := subvolRoot
-	if dirRel != "" {
-		dir = filepath.Join(subvolRoot, dirRel)
-	}
-	// Scan dir for the inode
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return "", err
-	}
-	for _, e := range entries {
-		fi, err := e.Info()
-		if err != nil {
-			continue
-		}
-		st, ok := fi.Sys().(*syscall.Stat_t)
-		if !ok {
-			continue
-		}
-		if st.Ino == inum {
-			return filepath.Join(dir, e.Name()), nil
-		}
-	}
-	return "", fmt.Errorf("inum %d not found in %s", inum, dir)
+	return filepath.Join(subvolPath, rel), nil
 }
 
 // Cache of root → subvol path (relative to mount). Filled lazily by

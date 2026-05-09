@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.5"
+const VERSION = "0.1.6"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -634,6 +634,21 @@ func logRefErr(phase string, root, inum, offset uint64, err error) {
 	}
 }
 
+// logRefErrIoctl is the ioctl-specific variant — adds context that's only
+// known at the FIDEDUPERANGE call site (offsets + lengths + file sizes).
+func logRefErrIoctl(root, inum, sibOffset, srcOffset, length, srcSize, dstSize uint64, err error) {
+	v, _ := refErrCounts.LoadOrStore("ioctl", new(atomic.Int32))
+	cnt := v.(*atomic.Int32)
+	n := cnt.Add(1)
+	if n <= REF_ERR_SAMPLES {
+		fmt.Fprintf(os.Stderr, "  [reflink-err ioctl #%d] root=%d inum=%d sibOff=%d srcOff=%d len=%d srcSize=%d dstSize=%d: %v\n",
+			n, root, inum, sibOffset, srcOffset, length, srcSize, dstSize, err)
+	}
+	if n == REF_ERR_SAMPLES+1 {
+		fmt.Fprintf(os.Stderr, "  [reflink-err ioctl] further errors of this kind suppressed\n")
+	}
+}
+
 // =================================================================
 // File-level processing
 // =================================================================
@@ -958,18 +973,52 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 				logRefErr("open", r.root, r.inum, r.offset, err)
 				continue
 			}
-			// FIDEDUPERANGE: pull sibling [r.offset, r.offset+oldLen] to point
-			// at the live's compressed range [ex.logical, ex.logical+oldLen].
-			// Use oldLen — that's the original (uncompressed) extent length
-			// that both sides share. FIEMAP returns logical (uncompressed)
-			// length even for compressed extents.
-			_, derr := fideduperange(fdRW, ex.logical, sibFd, r.offset, oldLen)
+			// Determine usable length: clamp to min(extent length, sibling
+			// remaining bytes from r.offset). FIDEDUPERANGE rejects requests
+			// whose dst range extends past EOF (EINVAL).
+			var sibStat syscall.Stat_t
+			if ferr := syscall.Fstat(sibFd, &sibStat); ferr != nil {
+				syscall.Close(sibFd)
+				cnt.refDedupFailed.Add(1)
+				logRefErr("fstat", r.root, r.inum, r.offset, ferr)
+				continue
+			}
+			sibSize := uint64(sibStat.Size)
+			if r.offset >= sibSize {
+				syscall.Close(sibFd)
+				cnt.refDedupFailed.Add(1)
+				continue // stale ref past EOF
+			}
+			useLen := oldLen
+			if r.offset+useLen > sibSize {
+				useLen = sibSize - r.offset
+			}
+			// Same clamp on src side — live file's size from earlier stat
+			liveRemaining := uint64(size) - ex.logical
+			if useLen > liveRemaining {
+				useLen = liveRemaining
+			}
+			// Block-alignment: if our range doesn't extend exactly to EOF on
+			// either side, length must be a multiple of the filesystem block
+			// size (FS uses 4096 universally for btrfs metadata blocks).
+			const blockSize = 4096
+			srcAtEOF := ex.logical+useLen == uint64(size)
+			dstAtEOF := r.offset+useLen == sibSize
+			if !srcAtEOF && !dstAtEOF {
+				useLen = (useLen / blockSize) * blockSize
+			}
+			if useLen == 0 {
+				syscall.Close(sibFd)
+				continue
+			}
+
+			_, derr := fideduperange(fdRW, ex.logical, sibFd, r.offset, useLen)
 			syscall.Close(sibFd)
 			if derr == nil {
 				cnt.reflinks.Add(1)
 			} else {
 				cnt.refDedupFailed.Add(1)
-				logRefErr("ioctl", r.root, r.inum, r.offset, derr)
+				logRefErrIoctl(r.root, r.inum, r.offset, ex.logical, useLen, uint64(size), sibSize, derr)
 			}
 		}
 		if hasSiblings {

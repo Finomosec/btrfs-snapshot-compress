@@ -295,10 +295,6 @@ The tool only writes via two well-tested kernel ioctls:
 - **`FIDEDUPERANGE`** — kernel performs a **byte-by-byte verification** of
   src vs dst before retargeting any extent. Cannot corrupt data.
 
-To verify after a run: `git status` on git-tracked subvols, `sha256sum`
-comparisons against backups, or `btrfs scrub start -B` for full filesystem
-checksum verification.
-
 ## Combine with btrfs-snapshot-dedup
 
 Because compress and dedup are different operations, they compose cleanly:

@@ -65,9 +65,11 @@ The "danger window" is bounded by a single extent (typically ≤ 128 MB), not a
 whole file. Atomic per-extent — compressions never accumulate without their
 reflink propagation.
 
-## Smart-Speed Mode (`--smart-speed`)
+## Smart-Speed (always on)
 
-Per-extension learning, case-insensitive:
+Per-extension learning, case-insensitive. Always active — the default
+behaviour. Real-world workloads have shown 80 %+ of files reach the fastpath
+after a few thousand probes, drastically cutting probe-I/O.
 
 - After **20 samples** per extension (configurable via `-smart-min-samples`):
   - **< 10 % compressible** → skip the whole extension
@@ -83,6 +85,41 @@ compressible — counter-intuitive but solid — and `.beam` (Erlang bytecode) /
 A static blacklist of always-skipped extensions (`mp4 jpg jpeg png webp mov mp3
 m4a flac zip gz bz2 xz zst 7z rar iso ...`) runs before smart-speed and can be
 disabled via `-skip-incompressible-ext=false`.
+
+### Thorough mode — never skip an extension
+
+If you want every file at least *evaluated*, without smart-speed locking
+whole extensions out as "almost always incompressible":
+
+```bash
+sudo ./btrfs-snapshot-compress -smart-skip-thresh=0 /mnt/btrfs mysubvol
+```
+
+`-smart-skip-thresh=0` means "skip extension only if < 0 % compressible" — a
+threshold that's never reached, so no extension is ever skipped wholesale.
+Every file goes through either probe-then-compress or fastpath-compress.
+Fastpath stays active and is normally what you want: it skips the probe-read
+for extensions with > 95 % success rate (`.txt`, `.js`, etc.) but still
+compresses the file. No thoroughness lost — just probe-I/O saved on data
+that practically always compresses.
+
+This is the recommended thorough setting.
+
+### Strict mode — probe every file individually
+
+Rarely needed. In strict mode every individual file is probed, even those
+in extensions that have been observed at 100 % compressible. The decision
+to compress is based on *that file's own* probe, not on the extension's
+historical rate. Edge cases this catches: a `.txt` that happens to contain
+random data, etc.
+
+```bash
+sudo ./btrfs-snapshot-compress -smart-skip-thresh=0 -smart-fast-thresh=2.0 /mnt/btrfs mysubvol
+```
+
+`-smart-fast-thresh=2.0` is unreachable since rates are in [0, 1] — fastpath
+never triggers, every file is probed. Costs more I/O and CPU than the default
+or thorough mode; only useful for forensic / pathological scenarios.
 
 ## Requirements
 

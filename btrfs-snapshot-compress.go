@@ -62,7 +62,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.1"
+const VERSION = "0.1.2"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -549,6 +549,28 @@ func resolveSubvolPath(mount string, mountFd int, root uint64) (string, error) {
 }
 
 // =================================================================
+// Reflink error sampling — log first N errors per phase to stderr
+// so we can diagnose systemic failures quickly.
+// =================================================================
+
+const REF_ERR_SAMPLES = 5
+
+var refErrCounts sync.Map // phase string → *atomic.Int32
+
+func logRefErr(phase string, root, inum, offset uint64, err error) {
+	v, _ := refErrCounts.LoadOrStore(phase, new(atomic.Int32))
+	cnt := v.(*atomic.Int32)
+	n := cnt.Add(1)
+	if n <= REF_ERR_SAMPLES {
+		fmt.Fprintf(os.Stderr, "  [reflink-err %s #%d] root=%d inum=%d offset=%d: %v\n",
+			phase, n, root, inum, offset, err)
+	}
+	if n == REF_ERR_SAMPLES+1 {
+		fmt.Fprintf(os.Stderr, "  [reflink-err %s] further errors of this kind suppressed\n", phase)
+	}
+}
+
+// =================================================================
 // File-level processing
 // =================================================================
 
@@ -861,25 +883,32 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 			sibPath, err := rootInumToPath(mount, mountFd, r.root, r.inum)
 			if err != nil {
 				cnt.refDedupFailed.Add(1)
+				logRefErr("path-resolve", r.root, r.inum, r.offset, err)
 				continue
 			}
-			sibFd, err := syscall.Open(sibPath, syscall.O_RDONLY, 0)
+			// Try RDWR first (works for normal files), fall back to RDONLY
+			// (needed for read-only snapshots).
+			sibFd, err := syscall.Open(sibPath, syscall.O_RDWR, 0)
 			if err != nil {
-				cnt.refDedupFailed.Add(1)
-				continue
+				sibFd, err = syscall.Open(sibPath, syscall.O_RDONLY, 0)
+				if err != nil {
+					cnt.refDedupFailed.Add(1)
+					logRefErr("open", r.root, r.inum, r.offset, err)
+					continue
+				}
 			}
-			// FIDEDUPERANGE: pull sibling at r.offset, len=newLen, to the live
-			// extent at ex.logical with same length.
-			useLen := newLen
-			if useLen > oldLen {
-				useLen = oldLen
-			}
-			_, derr := fideduperange(fdRW, ex.logical, sibFd, r.offset, useLen)
+			// FIDEDUPERANGE: pull sibling [r.offset, r.offset+oldLen] to point
+			// at the live's compressed range [ex.logical, ex.logical+oldLen].
+			// Use oldLen — that's the original (uncompressed) extent length
+			// that both sides share. FIEMAP returns logical (uncompressed)
+			// length even for compressed extents.
+			_, derr := fideduperange(fdRW, ex.logical, sibFd, r.offset, oldLen)
 			syscall.Close(sibFd)
 			if derr == nil {
 				cnt.reflinks.Add(1)
 			} else {
 				cnt.refDedupFailed.Add(1)
+				logRefErr("ioctl", r.root, r.inum, r.offset, derr)
 			}
 		}
 		if hasSiblings {

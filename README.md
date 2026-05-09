@@ -73,7 +73,7 @@ after a few thousand probes, drastically cutting probe-I/O.
 
 - After **20 samples** per extension (configurable via `-smart-min-samples`):
   - **< 10 % compressible** → skip the whole extension
-  - **> 95 % compressible** → fastpath (compress without probing)
+  - **≥ 90 % compressible** → fastpath (compress without probing)
 - **1-in-50 resample** for drift detection (`-smart-resample`)
 - Files without an extension are always probed
 
@@ -215,7 +215,7 @@ sudo ./btrfs-snapshot-compress -start-at 'path/to/last/file' /mnt/btrfs mysubvol
 | `-smart-speed` | `false` | Enable per-extension learning |
 | `-smart-min-samples` | `20` | Smart-speed: probes before locking in a decision |
 | `-smart-skip-thresh` | `0.10` | Smart-speed: < X compressible-rate → skip whole extension |
-| `-smart-fast-thresh` | `0.95` | Smart-speed: > X compressible-rate → skip probe (fastpath) |
+| `-smart-fast-thresh` | `0.90` | Smart-speed: ≥ X compressible-rate → skip probe (fastpath) |
 | `-smart-resample` | `50` | Smart-speed: probe 1-in-N files even after lock-in |
 
 ## Output

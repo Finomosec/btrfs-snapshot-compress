@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.2.0"
+const VERSION = "0.2.1"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -751,7 +751,7 @@ func (ss *smartSpeed) decide(ext string) (doProbe, doProcess bool) {
 	if rate < ss.skipThresh {
 		return false, false // skip whole file
 	}
-	if rate > ss.fastThresh {
+	if rate >= ss.fastThresh {
 		return false, true // skip probe, compress directly
 	}
 	return true, true
@@ -1077,7 +1077,7 @@ func main() {
 	smartMinSamples := flag.Int("smart-min-samples", 20, "smart-speed: minimum probe samples per extension before locking in")
 	smartResample := flag.Int("smart-resample", 50, "smart-speed: probe 1-in-N files even after lock-in (drift detection)")
 	smartSkipThresh := flag.Float64("smart-skip-thresh", 0.10, "smart-speed: <X compressible-rate → skip whole extension. Set to 0 to disable extension-skipping (probe every file individually — slower but most thorough).")
-	smartFastThresh := flag.Float64("smart-fast-thresh", 0.95, "smart-speed: >X compressible-rate → skip probe (fastpath). Set to 2.0 to disable fastpath entirely.")
+	smartFastThresh := flag.Float64("smart-fast-thresh", 0.90, "smart-speed: ≥X compressible-rate → skip probe (fastpath). Set to 2.0 to disable fastpath entirely.")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -1148,7 +1148,7 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "Workers: %d   Min-size: %s   Probe-ratio: %.2f×   Ext-blacklist: %v\n",
 		*workers, fmtBytes(*minSize), *probeRatioMin, *skipExt)
-	fmt.Fprintf(os.Stderr, "Smart-speed: min-samples=%d   skip<%.0f%%   fast>%.0f%%   resample=1/%d\n",
+	fmt.Fprintf(os.Stderr, "Smart-speed: min-samples=%d   skip<%.0f%%   fast≥%.0f%%   resample=1/%d\n",
 		*smartMinSamples, *smartSkipThresh*100, *smartFastThresh*100, *smartResample)
 	if *smartSkipThresh <= 0 && *smartFastThresh > 1 {
 		fmt.Fprintln(os.Stderr, "             (effectively disabled — every file probed individually)")

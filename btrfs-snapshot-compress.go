@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.2.3"
+const VERSION = "0.3.0"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -696,20 +696,18 @@ type extStats struct {
 
 type smartSpeed struct {
 	minSamples int
-	skipThresh float64 // <X compressible → ALWAYS_SKIP
-	fastThresh float64 // >X compressible → FASTPATH
-	resampleN  int     // 1-in-N: force probe even in locked-in mode
+	skipThresh float64 // mean encoded-rate < X → skip whole extension
+	resampleN  int     // 1-in-N: force a probe-attempt even in skip mode (drift detection)
 
 	mu    sync.RWMutex
 	stats map[string]*extStats
-	seen  atomic.Int64 // total decisions made (for resample)
+	seen  atomic.Int64 // total skip-decisions made (for resample)
 }
 
-func newSmartSpeed(minSamples, resampleN int, skipThresh, fastThresh float64) *smartSpeed {
+func newSmartSpeed(minSamples, resampleN int, skipThresh float64) *smartSpeed {
 	return &smartSpeed{
 		minSamples: minSamples,
 		skipThresh: skipThresh,
-		fastThresh: fastThresh,
 		resampleN:  resampleN,
 		stats:      make(map[string]*extStats),
 	}
@@ -718,10 +716,19 @@ func newSmartSpeed(minSamples, resampleN int, skipThresh, fastThresh float64) *s
 // decide returns (doProbe, doProcess) based on ext history.
 //   doProbe=true   → run the probe before deciding to compress
 //   doProcess=true → process the file at all (false = skip)
-// Extensionless files always (true,true). Cold start always (true,true).
 //
-// To disable smart-speed entirely: set skipThresh=0 (never skip) and
-// fastThresh=2.0 (never fastpath, since rate ≤ 1.0 always).
+// Two regimes:
+//   - Warmup (total < minSamples): always probe, always process
+//   - Locked-in (total ≥ minSamples):
+//       rate < skipThresh → skip
+//       rate ≥ skipThresh → compress (no probe; the post-defrag encoded-ratio
+//                            feedback keeps the metric honest over time)
+//
+// Even in the "skip" branch, every Nth decision still tries — this catches
+// data drift (e.g., a previously-incompressible extension starts containing
+// compressible files).
+//
+// Extensionless files always (true,true).
 func (ss *smartSpeed) decide(ext string) (doProbe, doProcess bool) {
 	if ext == "" {
 		return true, true
@@ -738,23 +745,19 @@ func (ss *smartSpeed) decide(ext string) (doProbe, doProcess bool) {
 	succ := s.success
 	s.mu.Unlock()
 	if n < ss.minSamples {
-		return true, true
+		return true, true // warmup
 	}
 	rate := float64(succ) / float64(n)
-
-	// Periodic resample: even in locked-in modes, every N-th decision forces a probe
-	seen := ss.seen.Add(1)
-	if ss.resampleN > 0 && seen%int64(ss.resampleN) == 0 {
-		return true, true
-	}
-
 	if rate < ss.skipThresh {
-		return false, false // skip whole file
+		// Skip-mode with periodic resampling for drift detection
+		seen := ss.seen.Add(1)
+		if ss.resampleN > 0 && seen%int64(ss.resampleN) == 0 {
+			return true, true
+		}
+		return false, false
 	}
-	if rate >= ss.fastThresh {
-		return false, true // skip probe, compress directly
-	}
-	return true, true
+	// Compress-mode: no probe needed; real defrag outcome will feed the metric
+	return false, true
 }
 
 // record updates per-ext stats.
@@ -1103,10 +1106,9 @@ func main() {
 	probeRatioMin := flag.Float64("probe-ratio", 1.20, "minimum compression ratio to actually compress (otherwise skip file)")
 	minSize := flag.Int64("min-size", 4096, "skip files smaller than this many bytes")
 	skipExt := flag.Bool("skip-incompressible-ext", true, "skip known-incompressible extensions (mp4, jpg, zip, …) without probing")
-	smartMinSamples := flag.Int("smart-min-samples", 20, "smart-speed: minimum probe samples per extension before locking in")
-	smartResample := flag.Int("smart-resample", 50, "smart-speed: probe 1-in-N files even after lock-in (drift detection)")
-	smartSkipThresh := flag.Float64("smart-skip-thresh", 0.10, "smart-speed: <X compressible-rate → skip whole extension. Set to 0 to disable extension-skipping (probe every file individually — slower but most thorough).")
-	smartFastThresh := flag.Float64("smart-fast-thresh", 0.90, "smart-speed: ≥X compressible-rate → skip probe (fastpath). Set to 2.0 to disable fastpath entirely.")
+	smartMinSamples := flag.Int("smart-min-samples", 20, "smart-speed: minimum samples per extension before locking in (warmup)")
+	smartResample := flag.Int("smart-resample", 50, "smart-speed: in skip-mode, still probe 1-in-N files (drift detection). Set ≤0 to disable resampling.")
+	smartSkipThresh := flag.Float64("smart-skip-thresh", 0.30, "smart-speed: extension is skipped when mean encoded-rate < X. Set to 0 to disable extension-skipping (every file gets a probe + defrag attempt — most thorough).")
 	flag.Usage = printUsage
 	flag.Parse()
 
@@ -1177,14 +1179,16 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "Workers: %d   Min-size: %s   Probe-ratio: %.2f×   Ext-blacklist: %v\n",
 		*workers, fmtBytes(*minSize), *probeRatioMin, *skipExt)
-	fmt.Fprintf(os.Stderr, "Smart-speed: min-samples=%d   skip<%.0f%%   fast≥%.0f%%   resample=1/%d\n",
-		*smartMinSamples, *smartSkipThresh*100, *smartFastThresh*100, *smartResample)
-	if *smartSkipThresh <= 0 && *smartFastThresh > 1 {
-		fmt.Fprintln(os.Stderr, "             (effectively disabled — every file probed individually)")
-	} else if *smartSkipThresh <= 0 {
-		fmt.Fprintln(os.Stderr, "             (no extension-skipping — every file probed; fastpath still active)")
+	resampleStr := fmt.Sprintf("1/%d", *smartResample)
+	if *smartResample <= 0 {
+		resampleStr = "off"
 	}
-	ss := newSmartSpeed(*smartMinSamples, *smartResample, *smartSkipThresh, *smartFastThresh)
+	fmt.Fprintf(os.Stderr, "Smart-speed: min-samples=%d   skip<%.0f%%   resample=%s\n",
+		*smartMinSamples, *smartSkipThresh*100, resampleStr)
+	if *smartSkipThresh <= 0 {
+		fmt.Fprintln(os.Stderr, "             (no extension-skipping — every file gets a probe + defrag attempt)")
+	}
+	ss := newSmartSpeed(*smartMinSamples, *smartResample, *smartSkipThresh)
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 	fmt.Fprintln(os.Stderr, "  found     = files matched by walker")
 	fmt.Fprintln(os.Stderr, "  buf       = files queued waiting")

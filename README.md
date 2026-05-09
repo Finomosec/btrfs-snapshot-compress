@@ -67,29 +67,36 @@ reflink propagation.
 
 ## Smart-Speed (always on)
 
-Per-extension learning, case-insensitive. Always active — the default
-behaviour. Real-world workloads have shown 80 %+ of files reach the fastpath
-after a few thousand probes, drastically cutting probe-I/O.
+Per-extension learning, case-insensitive. Two regimes:
 
-- After **20 samples** per extension (configurable via `-smart-min-samples`):
-  - **< 10 % compressible** → skip the whole extension
-  - **≥ 90 % compressible** → fastpath (compress without probing)
-- **1-in-50 resample** for drift detection (`-smart-resample`)
-- Files without an extension are always probed
+- **Warmup** — first `-smart-min-samples` (default 20) files of an extension
+  are individually probed (128 KiB read + zstd test). Each file is then
+  defrag-compressed if probe says it's worth it.
+- **Locked-in** — once the extension has ≥ min-samples, the per-extension
+  mean encoded-rate decides:
+  - **< 30 %** compressible → skip the whole extension
+  - **≥ 30 %** compressible → compress directly (no probe; btrfs's
+    chunk-level decision keeps only the chunks that actually compress)
 
-The final summary lists the top observed extensions with their compressible-rate.
-On real-world data we've observed binaries (`.dll .so .exe`) at 95–100 %
-compressible — counter-intuitive but solid — and `.beam` (Erlang bytecode) /
-`.rpgmvp` (RPG Maker encrypted PNG) / `.pdf` at the low end.
+The metric is fed by **real defrag outcomes** (FIEMAP_EXTENT_ENCODED ratio
+post-defrag), not the probe alone — so an extension with a compressible
+header but incompressible body (some `.exe`, `.bin`) eventually drops below
+the threshold even if its first 128 KiB looks promising.
 
-A static blacklist of always-skipped extensions (`mp4 jpg jpeg png webp mov mp3
-m4a flac zip gz bz2 xz zst 7z rar iso ...`) runs before smart-speed and can be
-disabled via `-skip-incompressible-ext=false`.
+**Drift detection**: in skip-mode, every Nth decision still probes a file
+(`-smart-resample`, default 1/50). If the data drifts toward compressibility,
+the metric notices. Set `-smart-resample=0` to disable.
+
+Files without an extension are always probed (no learning signal possible).
+
+A static blacklist of always-skipped extensions (`mp4 jpg jpeg png webp mov
+mp3 m4a flac zip gz bz2 xz zst 7z rar iso ...`) runs before smart-speed and
+can be disabled via `-skip-incompressible-ext=false`.
 
 ### Thorough mode — never skip an extension
 
-If you want every file at least *evaluated*, without smart-speed locking
-whole extensions out as "almost always incompressible":
+If you want every file probed and (if probe passes) defragged regardless of
+the extension's history:
 
 ```bash
 sudo ./btrfs-snapshot-compress -smart-skip-thresh=0 /mnt/btrfs mysubvol
@@ -97,29 +104,11 @@ sudo ./btrfs-snapshot-compress -smart-skip-thresh=0 /mnt/btrfs mysubvol
 
 `-smart-skip-thresh=0` means "skip extension only if < 0 % compressible" — a
 threshold that's never reached, so no extension is ever skipped wholesale.
-Every file goes through either probe-then-compress or fastpath-compress.
-Fastpath stays active and is normally what you want: it skips the probe-read
-for extensions with > 95 % success rate (`.txt`, `.js`, etc.) but still
-compresses the file. No thoroughness lost — just probe-I/O saved on data
-that practically always compresses.
+Every file goes through probe-then-compress.
 
-This is the recommended thorough setting.
-
-### Strict mode — probe every file individually
-
-Rarely needed. In strict mode every individual file is probed, even those
-in extensions that have been observed at 100 % compressible. The decision
-to compress is based on *that file's own* probe, not on the extension's
-historical rate. Edge cases this catches: a `.txt` that happens to contain
-random data, etc.
-
-```bash
-sudo ./btrfs-snapshot-compress -smart-skip-thresh=0 -smart-fast-thresh=2.0 /mnt/btrfs mysubvol
-```
-
-`-smart-fast-thresh=2.0` is unreachable since rates are in [0, 1] — fastpath
-never triggers, every file is probed. Costs more I/O and CPU than the default
-or thorough mode; only useful for forensic / pathological scenarios.
+Costs more I/O than the default (no probe-shortcut for known-compressible
+extensions, no whole-extension skipping for known-bad ones), but ensures
+every file's individual probe result decides its fate.
 
 ## Requirements
 
@@ -212,10 +201,9 @@ sudo ./btrfs-snapshot-compress -start-at 'path/to/last/file' /mnt/btrfs mysubvol
 | `-min-size` | `4096` | Skip files smaller than this many bytes |
 | `-probe-ratio` | `1.20` | Minimum compression ratio to actually compress (else skip file) |
 | `-skip-incompressible-ext` | `true` | Skip known-incompressible extensions without probing |
-| `-smart-min-samples` | `20` | Smart-speed: probes before locking in a decision |
-| `-smart-skip-thresh` | `0.10` | Smart-speed: < X compressible-rate → skip whole extension |
-| `-smart-fast-thresh` | `0.90` | Smart-speed: ≥ X compressible-rate → skip probe (fastpath) |
-| `-smart-resample` | `50` | Smart-speed: probe 1-in-N files even after lock-in |
+| `-smart-min-samples` | `20` | Smart-speed: warmup probes before locking in |
+| `-smart-skip-thresh` | `0.30` | Smart-speed: extension skipped when mean encoded-rate < X. Set 0 to disable extension-skipping. |
+| `-smart-resample` | `50` | Smart-speed: in skip-mode, probe 1-in-N files for drift detection. Set ≤0 to disable. |
 
 ## Output
 

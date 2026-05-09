@@ -309,20 +309,28 @@ func logicalResolve(mountFd int, phys uint64) ([]reflinkRef, error) {
 	if errno != 0 {
 		return nil, errno
 	}
-	// Result: btrfs_data_container header (32 bytes) + array of u64 triples (inum, offset, root)
-	if len(buf) < 32 {
+	// Result: btrfs_data_container header (16 bytes: 4× u32) + array of u64 triples (inum, offset, root).
+	//   bytes_left    : u32 @ 0:4
+	//   bytes_missing : u32 @ 4:8
+	//   elem_cnt      : u32 @ 8:12
+	//   elem_missed   : u32 @ 12:16
+	//   val[]         : u64-array starting at offset 16
+	if len(buf) < 16 {
 		return nil, nil
 	}
 	bytesLeft := binary.LittleEndian.Uint32(buf[0:4])
-	elemCnt := binary.LittleEndian.Uint32(buf[4:8])
-	elemMissed := binary.LittleEndian.Uint32(buf[8:12])
+	bytesMissing := binary.LittleEndian.Uint32(buf[4:8])
+	elemCnt := binary.LittleEndian.Uint32(buf[8:12])
+	elemMissed := binary.LittleEndian.Uint32(buf[12:16])
 	_ = bytesLeft
+	_ = bytesMissing
 	_ = elemMissed
-	// Triples count: elemCnt counts total u64s, divide by 3
+	// elem_cnt is the count of u64 elements written. LOGICAL_INO returns
+	// triples (inum, offset, root) → tripleCnt = elemCnt / 3.
 	tripleCnt := int(elemCnt) / 3
 	out := make([]reflinkRef, 0, tripleCnt)
 	for i := 0; i < tripleCnt; i++ {
-		off := 32 + i*24
+		off := 16 + i*24
 		if off+24 > len(buf) {
 			break
 		}
@@ -560,7 +568,10 @@ type counters struct {
 	poorRatio       atomic.Int64
 
 	compressed      atomic.Int64
-	reflinks        atomic.Int64
+	reflinks        atomic.Int64 // FIDEDUPERANGE successes
+	refsFound       atomic.Int64 // LOGICAL_INO returned ≥1 sibling
+	refDedupFailed  atomic.Int64 // FIDEDUPERANGE attempted but errored
+	logicalInoErr   atomic.Int64 // LOGICAL_INO_V2 ioctl errored
 	bytesSaved      atomic.Int64
 
 	pending         atomic.Int64
@@ -827,7 +838,11 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 		// Reflink propagation: find every other (root, inum, offset) referring
 		// to oldPhys → FIDEDUPERANGE that range to point at the new extent.
 		refs, err := logicalResolve(mountFd, oldPhys)
-		if err != nil || len(refs) == 0 {
+		if err != nil {
+			cnt.logicalInoErr.Add(1)
+			continue
+		}
+		if len(refs) == 0 {
 			continue
 		}
 
@@ -836,17 +851,21 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 		_ = syscall.Fstat(fdRW, &selfStat)
 		selfInum := selfStat.Ino
 
+		hasSiblings := false
 		for _, r := range refs {
 			if r.inum == selfInum {
 				continue
 			}
+			hasSiblings = true
 			// Resolve sibling path
 			sibPath, err := rootInumToPath(mount, mountFd, r.root, r.inum)
 			if err != nil {
+				cnt.refDedupFailed.Add(1)
 				continue
 			}
 			sibFd, err := syscall.Open(sibPath, syscall.O_RDONLY, 0)
 			if err != nil {
+				cnt.refDedupFailed.Add(1)
 				continue
 			}
 			// FIDEDUPERANGE: pull sibling at r.offset, len=newLen, to the live
@@ -859,7 +878,12 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 			syscall.Close(sibFd)
 			if derr == nil {
 				cnt.reflinks.Add(1)
+			} else {
+				cnt.refDedupFailed.Add(1)
 			}
+		}
+		if hasSiblings {
+			cnt.refsFound.Add(1)
 		}
 	}
 }
@@ -982,8 +1006,9 @@ func main() {
 	fmt.Fprintln(os.Stderr, "  skip      = ext-blacklist/below-min-size/nocow/already-compressed/smart-skip")
 	fmt.Fprintln(os.Stderr, "  probed    = files where probe-compress was run (fast= bypassed by smart-speed)")
 	fmt.Fprintln(os.Stderr, "  poor      = files skipped because probe ratio was below threshold")
-	fmt.Fprintln(os.Stderr, "  cmp/refl  = extents recompressed / reflink siblings updated")
-	fmt.Fprintln(os.Stderr, "  saved     = approx. on-disk bytes freed (uncompressed - compressed)")
+	fmt.Fprintln(os.Stderr, "  cmp       = extents recompressed")
+	fmt.Fprintln(os.Stderr, "  refs      = filesWithSiblings/dedupSucc/dedupFail/lookupErr — reflink propagation diagnostics")
+	fmt.Fprintln(os.Stderr, "  saved     = approx. on-disk bytes freed (uncompressed - compressed, before reflink-orphan)")
 	fmt.Fprintln(os.Stderr, "══════════════════════════════════════════════════════════════════════════════")
 
 	fileQ := NewSpillQueue(QUEUE_LIMIT)
@@ -1056,12 +1081,13 @@ func main() {
 			}
 			savedStr := fmtBytes(cnt.bytesSaved.Load())
 			fmt.Fprintf(os.Stderr,
-				"  [%s] found=%d buf=%d checked=%d/%d/%d/%d skip=%d/%d/%d/%d/%d probed=%d(fast=%d) poor=%d cmp/refl=%d/%d saved=%s%s\n",
+				"  [%s] found=%d buf=%d checked=%d/%d/%d/%d skip=%d/%d/%d/%d/%d probed=%d(fast=%d) poor=%d cmp=%d refs=%d/%d/%d/%d saved=%s%s\n",
 				fmtTime(elapsed), totalFound, fileQ.Buffered(),
 				checked, cnt.incompressible.Load(), cnt.notFound.Load(), cnt.changed.Load(),
 				cnt.skippedExt.Load(), cnt.skippedSize.Load(), cnt.skippedNocow.Load(), cnt.skippedAlready.Load(), cnt.skippedSmart.Load(),
 				cnt.probed.Load(), cnt.fastpath.Load(), cnt.poorRatio.Load(),
-				cnt.compressed.Load(), cnt.reflinks.Load(),
+				cnt.compressed.Load(),
+				cnt.refsFound.Load(), cnt.reflinks.Load(), cnt.refDedupFailed.Load(), cnt.logicalInoErr.Load(),
 				savedStr, etaStr,
 			)
 			select {
@@ -1119,8 +1145,11 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  probed:               %d\n", cnt.probed.Load())
 	fmt.Fprintf(os.Stderr, "  poor ratio (skipped): %d\n", cnt.poorRatio.Load())
 	fmt.Fprintf(os.Stderr, "  extents compressed:   %d\n", cnt.compressed.Load())
-	fmt.Fprintf(os.Stderr, "  reflinks updated:     %d\n", cnt.reflinks.Load())
-	fmt.Fprintf(os.Stderr, "  approx. bytes saved:  %s\n", fmtBytes(cnt.bytesSaved.Load()))
+	fmt.Fprintf(os.Stderr, "  files with reflinks:  %d (LOGICAL_INO returned ≥1 sibling)\n", cnt.refsFound.Load())
+	fmt.Fprintf(os.Stderr, "  reflinks updated:     %d (FIDEDUPERANGE successes)\n", cnt.reflinks.Load())
+	fmt.Fprintf(os.Stderr, "  reflink dedup failed: %d (FIDEDUPERANGE errored)\n", cnt.refDedupFailed.Load())
+	fmt.Fprintf(os.Stderr, "  LOGICAL_INO errors:   %d\n", cnt.logicalInoErr.Load())
+	fmt.Fprintf(os.Stderr, "  approx. bytes saved:  %s (gross — orphaned old extents become free space)\n", fmtBytes(cnt.bytesSaved.Load()))
 	if *smartSpeedFlag {
 		fmt.Fprintf(os.Stderr, "  smart-skipped files:  %d\n", cnt.skippedSmart.Load())
 		fmt.Fprintf(os.Stderr, "  fastpath (no probe):  %d\n", cnt.fastpath.Load())

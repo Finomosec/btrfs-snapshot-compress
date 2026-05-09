@@ -23,6 +23,7 @@ const unsigned long IOCTL_FIDEDUPERANGE     = FIDEDUPERANGE;
 const unsigned long IOCTL_LOGICAL_INO_V2    = BTRFS_IOC_LOGICAL_INO_V2;
 const unsigned long IOCTL_DEFRAG_RANGE      = BTRFS_IOC_DEFRAG_RANGE;
 const unsigned long IOCTL_INO_LOOKUP        = BTRFS_IOC_INO_LOOKUP;
+const unsigned long IOCTL_INO_PATHS         = BTRFS_IOC_INO_PATHS;
 
 const int DEDUPE_RANGE_SIZE        = sizeof(struct file_dedupe_range);
 const int DEDUPE_RANGE_INFO_SIZE   = sizeof(struct file_dedupe_range_info);
@@ -32,7 +33,6 @@ import "C"
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -56,13 +56,14 @@ var (
 	IOC_LOGICAL_INO_V2 = uintptr(C.IOCTL_LOGICAL_INO_V2)
 	IOC_DEFRAG_RANGE   = uintptr(C.IOCTL_DEFRAG_RANGE)
 	IOC_INO_LOOKUP     = uintptr(C.IOCTL_INO_LOOKUP)
+	IOC_INO_PATHS      = uintptr(C.IOCTL_INO_PATHS)
 
 	DEDUPE_RANGE_SIZE      = int(C.DEDUPE_RANGE_SIZE)
 	DEDUPE_RANGE_INFO_SIZE = int(C.DEDUPE_RANGE_INFO_SIZE)
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.4"
+const VERSION = "0.1.5"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -460,52 +461,81 @@ func isNocow(fd int) bool {
 }
 
 // =================================================================
-// Resolve (root, inum, offset) → absolute path
+// Path resolution: (root, inum) → absolute filesystem path
+//
+// We use BTRFS_IOC_INO_PATHS instead of BTRFS_IOC_INO_LOOKUP because the
+// latter only finds inode_ref entries — files in heavily populated
+// directories use inode_extref instead and INO_LOOKUP returns ENOENT
+// for them. INO_PATHS handles both ref types.
+//
+// INO_PATHS uses the FILE DESCRIPTOR's tree, not an explicit treeid arg.
+// So we cache one fd per subvol root, opened on the subvol's root path
+// (resolved via the `btrfs inspect-internal subvolid-resolve` subcommand,
+// matching the proven approach from btrfs-snapshot-dedup).
 // =================================================================
 
-// rootInumToPath uses BTRFS_IOC_INO_LOOKUP to map a (root, inum) pair to an
-// absolute filesystem path under `mount`.
-//
-// btrfs INO_LOOKUP with a non-zero objectid walks up the inode_ref tree and
-// returns the file's FULL path (including filename) RELATIVE to the subvol
-// root, NUL-terminated, in args.name.
-//
-// We then prepend the subvol's path-from-mount to get the absolute path.
-func rootInumToPath(mount string, mountFd int, root, inum uint64) (string, error) {
-	// btrfs_ioctl_ino_lookup_args: 16 bytes header + 4080 byte name buffer = 4096 total
-	const argsSize = 4096
-	args := make([]byte, argsSize)
-	binary.LittleEndian.PutUint64(args[0:8], root)
-	binary.LittleEndian.PutUint64(args[8:16], inum)
+const INO_PATH_ARGS_SIZE = 56
 
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd), IOC_INO_LOOKUP, uintptr(unsafe.Pointer(&args[0])))
+// inoPaths runs BTRFS_IOC_INO_PATHS on treeFd for inum.
+// Returns paths RELATIVE to the subvol root of treeFd (one per hardlink).
+func inoPaths(treeFd int, inum uint64) ([]string, error) {
+	bufSize := 65536
+	buf := make([]byte, bufSize)
+
+	args := make([]byte, INO_PATH_ARGS_SIZE)
+	binary.LittleEndian.PutUint64(args[0:8], inum)
+	binary.LittleEndian.PutUint64(args[8:16], uint64(bufSize))
+	// reserved [4]u64 at 16:48 — already zeroed
+	binary.LittleEndian.PutUint64(args[48:56], uint64(uintptr(unsafe.Pointer(&buf[0]))))
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(treeFd), IOC_INO_PATHS,
+		uintptr(unsafe.Pointer(&args[0])))
 	if errno != 0 {
-		return "", errno
-	}
-	// args[16:] is NUL-terminated. The kernel returns "dir1/dir2/filename"
-	// (no leading slash, no trailing slash for files; but historically it
-	// can have a trailing slash). Strip both for safety.
-	rel := strings.Trim(string(bytes.TrimRight(args[16:], "\x00")), "/")
-	if rel == "" {
-		// Empty for the subvol root inode itself — caller doesn't expect a "directory" sibling
-		return "", fmt.Errorf("empty path for root=%d inum=%d (subvol root?)", root, inum)
+		return nil, errno
 	}
 
-	subvolPath, err := resolveSubvolPath(mount, mountFd, root)
-	if err != nil {
-		return "", err
+	// btrfs_data_container header: bytes_left, bytes_missing, elem_cnt, elem_missed
+	if len(buf) < 16 {
+		return nil, nil
 	}
-	return filepath.Join(subvolPath, rel), nil
+	elemCnt := binary.LittleEndian.Uint32(buf[8:12])
+	const valStart = 16
+	paths := make([]string, 0, elemCnt)
+	for i := uint32(0); i < elemCnt; i++ {
+		valOff := valStart + int(i)*8
+		if valOff+8 > len(buf) {
+			break
+		}
+		// val[i] is a u64 byte-offset (relative to val[]) where the path string starts
+		pathOff := int(binary.LittleEndian.Uint64(buf[valOff : valOff+8]))
+		absOff := valStart + pathOff
+		if absOff < 0 || absOff >= len(buf) {
+			break
+		}
+		end := absOff
+		for end < len(buf) && buf[end] != 0 {
+			end++
+		}
+		paths = append(paths, string(buf[absOff:end]))
+	}
+	return paths, nil
 }
 
-// Cache of root → subvol path (relative to mount). Filled lazily by
-// reading the subvol tree via INO_LOOKUP on rootid (inum=0).
+// Per-subvol open fd cache. Opened lazily, never closed for the lifetime
+// of the program (modest fd usage: ≤ number of subvols on the FS).
+var (
+	subvolFdCacheMu sync.Mutex
+	subvolFdCache   = make(map[uint64]int)
+)
+
+// resolveSubvolPath uses `btrfs inspect-internal subvolid-resolve` (subprocess)
+// to map a subvol id to its absolute path under mount. Cached forever per root.
 var (
 	subvolPathCacheMu sync.Mutex
 	subvolPathCache   = make(map[uint64]string)
 )
 
-func resolveSubvolPath(mount string, mountFd int, root uint64) (string, error) {
+func resolveSubvolPath(mount string, root uint64) (string, error) {
 	subvolPathCacheMu.Lock()
 	if p, ok := subvolPathCache[root]; ok {
 		subvolPathCacheMu.Unlock()
@@ -513,25 +543,73 @@ func resolveSubvolPath(mount string, mountFd int, root uint64) (string, error) {
 	}
 	subvolPathCacheMu.Unlock()
 
-	// INO_LOOKUP with inum=0 returns the subvol's path relative to the FS top.
-	const argsSize = 4096
-	args := make([]byte, argsSize)
-	binary.LittleEndian.PutUint64(args[0:8], root)
-	binary.LittleEndian.PutUint64(args[8:16], 0)
-
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(mountFd), IOC_INO_LOOKUP, uintptr(unsafe.Pointer(&args[0])))
-	if errno != 0 {
-		return "", errno
+	out, err := exec.Command("btrfs", "inspect-internal", "subvolid-resolve",
+		fmt.Sprintf("%d", root), mount).Output()
+	if err != nil {
+		return "", fmt.Errorf("subvolid-resolve %d: %w", root, err)
 	}
-	rel := strings.TrimRight(string(bytes.TrimRight(args[16:], "\x00")), "/")
-	abs := mount
-	if rel != "" {
+	rel := strings.TrimRight(strings.TrimSpace(string(out)), "/")
+	// rel may already be the absolute mount path for top-level (subvol id 5)
+	abs := rel
+	if !strings.HasPrefix(rel, "/") {
 		abs = filepath.Join(mount, rel)
 	}
+
 	subvolPathCacheMu.Lock()
 	subvolPathCache[root] = abs
 	subvolPathCacheMu.Unlock()
 	return abs, nil
+}
+
+func getSubvolFd(mount string, root uint64) (int, error) {
+	subvolFdCacheMu.Lock()
+	if fd, ok := subvolFdCache[root]; ok {
+		subvolFdCacheMu.Unlock()
+		return fd, nil
+	}
+	subvolFdCacheMu.Unlock()
+
+	abs, err := resolveSubvolPath(mount, root)
+	if err != nil {
+		return -1, err
+	}
+	fd, err := syscall.Open(abs, syscall.O_RDONLY, 0)
+	if err != nil {
+		return -1, err
+	}
+
+	subvolFdCacheMu.Lock()
+	if existing, ok := subvolFdCache[root]; ok {
+		// Race: someone else opened in parallel. Close ours, use theirs.
+		syscall.Close(fd)
+		subvolFdCacheMu.Unlock()
+		return existing, nil
+	}
+	subvolFdCache[root] = fd
+	subvolFdCacheMu.Unlock()
+	return fd, nil
+}
+
+// rootInumToPath maps a (root, inum) pair to the absolute path of the file.
+// Returns first hardlink found; for dedup purposes any hardlink works
+// (FIDEDUPERANGE on one hardlink updates the underlying inode).
+func rootInumToPath(mount string, mountFd int, root, inum uint64) (string, error) {
+	subvolFd, err := getSubvolFd(mount, root)
+	if err != nil {
+		return "", err
+	}
+	paths, err := inoPaths(subvolFd, inum)
+	if err != nil {
+		return "", err
+	}
+	if len(paths) == 0 {
+		return "", fmt.Errorf("no paths for inum %d in tree %d", inum, root)
+	}
+	subvolPath, err := resolveSubvolPath(mount, root)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(subvolPath, paths[0]), nil
 }
 
 // =================================================================

@@ -173,7 +173,7 @@ Compress + reflink propagation generates substantial I/O. On a busy system
 SSD the foreground latency can suffer noticeably. Mitigations:
 
 ```bash
-sudo nice -n 19 ionice -c 3 ./btrfs-snapshot-compress -workers 1 -smart-speed /mnt/btrfs mysubvol
+sudo nice -n 19 ionice -c 3 ./btrfs-snapshot-compress -workers 1 /mnt/btrfs mysubvol
 ```
 
 - `nice -n 19` — lowest CPU priority
@@ -186,11 +186,11 @@ runtime grows roughly linearly, but the desktop stays responsive.
 ### Examples
 
 ```bash
-# Compress everything in mysubvol (with smart-speed learning)
-sudo ./btrfs-snapshot-compress -smart-speed /mnt/btrfs mysubvol
+# Compress everything in mysubvol
+sudo ./btrfs-snapshot-compress /mnt/btrfs mysubvol
 
 # Conservative first run on a near-full disk: tiny files only, single worker
-sudo ./btrfs-snapshot-compress -workers 1 -smart-speed \
+sudo ./btrfs-snapshot-compress -workers 1 \
   -size +4k -size -32k /mnt/btrfs mysubvol
 
 # Only common compressible extensions
@@ -212,7 +212,6 @@ sudo ./btrfs-snapshot-compress -start-at 'path/to/last/file' /mnt/btrfs mysubvol
 | `-min-size` | `4096` | Skip files smaller than this many bytes |
 | `-probe-ratio` | `1.20` | Minimum compression ratio to actually compress (else skip file) |
 | `-skip-incompressible-ext` | `true` | Skip known-incompressible extensions without probing |
-| `-smart-speed` | `false` | Enable per-extension learning |
 | `-smart-min-samples` | `20` | Smart-speed: probes before locking in a decision |
 | `-smart-skip-thresh` | `0.10` | Smart-speed: < X compressible-rate → skip whole extension |
 | `-smart-fast-thresh` | `0.90` | Smart-speed: ≥ X compressible-rate → skip probe (fastpath) |
@@ -241,9 +240,9 @@ sudo ./btrfs-snapshot-compress -start-at 'path/to/last/file' /mnt/btrfs mysubvol
 
 ### Final summary
 
-After completion, prints aggregate counters and (with `-smart-speed`) a top-N
-table of extensions with their observed compressible-rate. Useful both as a
-sanity-check and as a guide for tuning future runs.
+After completion, prints aggregate counters and a top-N table of extensions
+with their observed compressible-rate. Useful both as a sanity-check and as
+a guide for tuning future runs.
 
 ### Output files
 

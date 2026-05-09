@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.1.7"
+const VERSION = "0.1.8"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -1095,9 +1095,19 @@ func main() {
 	}
 
 	mount := strings.TrimRight(args[0], "/")
+	if mount == "" {
+		mount = "/" // "/" trimmed to "" — keep as root
+	}
 	subvol := strings.TrimRight(args[1], "/")
 	findFilter := args[2:]
-	live := mount + "/" + subvol
+	var live string
+	if subvol == "" || subvol == "." {
+		live = mount
+	} else if mount == "/" {
+		live = "/" + subvol
+	} else {
+		live = mount + "/" + subvol
+	}
 
 	if _, err := os.Stat(live); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: %s not found\n", live)

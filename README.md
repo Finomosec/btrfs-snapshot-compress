@@ -109,6 +109,43 @@ filter arguments. Default (no filter): `find <path> -type f`.
 
 `<subvolume>` can be `.` to scan the entire mount.
 
+### Important: top-level subvolume must be reachable
+
+Reflink siblings can live in any subvolume on the filesystem. The tool resolves
+sibling paths via `btrfs inspect-internal subvolid-resolve <id> <mount>` —
+which returns paths **relative to the FS top-level (subvolid=5)**.
+
+This means the mount you pass must either be the top-level itself, or it must
+expose all needed subvols as subdirectories. Practical options:
+
+- **Mount the top-level** somewhere accessible:
+  `sudo mount -o subvolid=5 /dev/your-luks-or-block-device /mnt/btrfs-top`
+  then run `sudo ./btrfs-snapshot-compress / mnt/btrfs-top .`
+- **Run on `/`** if your root is mounted with `subvolid=5` (some installs).
+- **Single-subvol-only mounts** (e.g. just `/home` with `subvolid=258`) are
+  not enough on their own — sibling resolution will fail for refs in other
+  subvols.
+
+If sibling resolution fails frequently, the `path-resolve` error counter in
+the status output will grow. Compression of the live file still works — only
+the reflink propagation fails for unreachable siblings.
+
+### Lowering system impact (recommended for system SSDs)
+
+Compress + reflink propagation generates substantial I/O. On a busy system
+SSD the foreground latency can suffer noticeably. Mitigations:
+
+```bash
+sudo nice -n 19 ionice -c 3 ./btrfs-snapshot-compress -workers 1 -smart-speed /mnt/btrfs mysubvol
+```
+
+- `nice -n 19` — lowest CPU priority
+- `ionice -c 3` — idle I/O class (only when nothing else needs disk)
+- `-workers 1` — process one file at a time
+
+`-workers 1` alone gives most of the win on heavily-loaded systems. Total
+runtime grows roughly linearly, but the desktop stays responsive.
+
 ### Examples
 
 ```bash

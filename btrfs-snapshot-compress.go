@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.2.1"
+const VERSION = "0.2.2"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -1222,19 +1222,59 @@ func main() {
 		defer ticker.Stop()
 		// First tick after 1s for early feedback
 		time.Sleep(1 * time.Second)
+
+		// Sliding window for recent-rate ETA — detects tail slowdown when
+		// the remaining files are big/slow and the lifetime average is too
+		// optimistic. Keep the last 6 ticks (~60 s history when interval=10s).
+		type tickSample struct {
+			t       time.Time
+			checked int64
+		}
+		const windowMax = 6
+		var window []tickSample
+
 		for {
 			elapsed := int(time.Since(startTime).Seconds())
 			totalFound := fileQ.Total()
 			checked := cnt.checked.Load()
 
+			// Update sliding window
+			window = append(window, tickSample{time.Now(), checked})
+			if len(window) > windowMax {
+				window = window[1:]
+			}
+
 			etaStr := ""
-			if findDone.Load() && totalFound > 0 && checked > 0 && checked < totalFound {
-				rate := float64(checked) / float64(elapsed)
-				if rate > 0 {
-					etaStr = fmt.Sprintf(" ETA:%s", fmtTime(int(float64(totalFound-checked)/rate)))
-				}
-			} else if findDone.Load() && checked >= totalFound && cnt.pending.Load() == 0 {
+			pending := cnt.pending.Load()
+			done := findDone.Load() && checked >= totalFound && pending == 0
+
+			if done {
 				etaStr = " done"
+			} else if findDone.Load() && totalFound > 0 && checked > 0 && checked < totalFound {
+				remaining := float64(totalFound - checked)
+				// Lifetime rate
+				overallRate := float64(checked) / float64(elapsed)
+				// Recent-window rate (uses oldest sample in window)
+				var recentRate float64
+				if len(window) >= 2 {
+					oldest := window[0]
+					dt := time.Since(oldest.t).Seconds()
+					if dt > 0 {
+						recentRate = float64(checked-oldest.checked) / dt
+					}
+				}
+				// Pick the slower rate (more pessimistic, more accurate at tail)
+				rate := overallRate
+				if recentRate > 0 && recentRate < rate {
+					rate = recentRate
+				}
+				if rate > 0 {
+					etaStr = fmt.Sprintf(" ETA:%s", fmtTime(int(remaining/rate)))
+				}
+				// Special tail indicator: < 5× workers files left and pending > 0
+				if totalFound-checked < int64(*workers*5) && pending > 0 {
+					etaStr = fmt.Sprintf(" trailing %d files%s", totalFound-checked, etaStr)
+				}
 			}
 			savedStr := fmtBytes(cnt.bytesSaved.Load())
 			fmt.Fprintf(os.Stderr,

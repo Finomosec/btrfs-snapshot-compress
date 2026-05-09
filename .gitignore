@@ -1,0 +1,5 @@
+btrfs-snapshot-compress
+*.log
+debug.log
+candidates.compress
+candidates.done

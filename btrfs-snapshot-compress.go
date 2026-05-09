@@ -63,7 +63,7 @@ var (
 	DEFRAG_RANGE_ARGS_SIZE = int(C.DEFRAG_RANGE_ARGS_SIZE)
 )
 
-const VERSION = "0.2.2"
+const VERSION = "0.2.3"
 
 const (
 	QUEUE_LIMIT       = 10000
@@ -866,10 +866,16 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 	}
 	if allEncoded {
 		cnt.skippedAlready.Add(1)
+		// File is already fully compressed — that's a positive signal for
+		// this extension's compressibility.
+		ss.record(ext, true)
 		return
 	}
 
-	// Probe-compress (unless smart-speed says we can trust this extension)
+	// Probe-compress (unless smart-speed says we can trust this extension).
+	// We don't record the probe outcome optimistically here — instead we
+	// record the *real* outcome (encoded-bytes ratio) after the defrag loop,
+	// which catches files where the head is compressible but the body isn't.
 	if doProbe {
 		cnt.probed.Add(1)
 		ratio, err := probeCompressible(fd, 0, size)
@@ -878,7 +884,6 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 			cnt.poorRatio.Add(1)
 			return
 		}
-		ss.record(ext, true)
 	} else {
 		cnt.fastpath.Add(1)
 	}
@@ -1029,6 +1034,30 @@ func processFile(path string, mountFd int, mount string, extBlacklist map[string
 		}
 		if hasSiblings {
 			cnt.refsFound.Add(1)
+		}
+	}
+
+	// Real-result smart-speed feedback: walk the file's final extents and
+	// measure how many bytes ended up encoded (compressed). Btrfs decides
+	// per ~128 KiB chunk to keep the compressed result only if it's smaller
+	// than uncompressed — so a file can have a compressible head and an
+	// incompressible body. The probe-only signal would falsely mark the
+	// extension as "compressible". This corrects that.
+	if ext != "" {
+		final, ferr := fiemap(fdRW, 1024)
+		if ferr == nil && len(final) > 0 {
+			var encodedBytes, totalBytes uint64
+			for _, fe := range final {
+				totalBytes += fe.length
+				if fe.flags&FIEMAP_EXTENT_ENCODED != 0 {
+					encodedBytes += fe.length
+				}
+			}
+			if totalBytes > 0 {
+				realRatio := float64(encodedBytes) / float64(totalBytes)
+				const ENCODED_RATIO_GOOD = 0.30 // ≥30 % of file ended up encoded → compressible
+				ss.record(ext, realRatio >= ENCODED_RATIO_GOOD)
+			}
 		}
 	}
 }
